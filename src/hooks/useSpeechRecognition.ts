@@ -57,6 +57,9 @@ export interface SpeechState {
   stop: () => void;
 }
 
+const MAX_AUTO_RESTARTS = 3;
+const RESTART_DELAY = 300;
+
 export function useSpeechRecognition(
   onEnd: (finalText: string) => void,
 ): SpeechState {
@@ -70,16 +73,25 @@ export function useSpeechRecognition(
   const onEndRef = useRef(onEnd);
   const startedRef = useRef(false);
   const stopRequestedRef = useRef(false);
+  const manualStopRef = useRef(false);
+  const autoRestartCountRef = useRef(0);
+  const restartTimerRef = useRef<number | null>(null);
   onEndRef.current = onEnd;
 
-  const start = useCallback(() => {
+  const clearRestartTimer = () => {
+    if (restartTimerRef.current !== null) {
+      window.clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+  };
+
+  // 创建并启动一次识别会话；不重置已积累的文字
+  const beginRecognition = useCallback(() => {
     const Ctor = getRecognizerCtor();
     if (!Ctor) return;
 
-    finalRef.current = '';
     startedRef.current = false;
     stopRequestedRef.current = false;
-    setFinalText('');
     setInterim('');
     setError(null);
 
@@ -91,8 +103,7 @@ export function useSpeechRecognition(
 
     rec.onstart = () => {
       startedRef.current = true;
-      // 用户可能在识别真正启动前就点了停止（如权限确认中），
-      // 启动后立即结束
+      // 用户在识别真正启动前点了停止（如权限确认中），启动后立即结束
       if (stopRequestedRef.current) {
         try {
           rec.stop();
@@ -127,11 +138,13 @@ export function useSpeechRecognition(
       if (event.error === 'aborted') {
         // 主动中止时的正常事件，不提示错误
       } else if (event.error === 'not-allowed') {
+        // 权限被拒：不再自动续录
+        manualStopRef.current = true;
         setError('未获得麦克风权限，请在浏览器地址栏左侧允许访问麦克风。');
       } else if (event.error === 'no-speech') {
-        setError('没有检测到声音，请靠近麦克风再试一次。');
+        // 静默处理，等待自动续录
       } else if (event.error === 'network') {
-        setError('网络连接失败，语音识别需要联网。');
+        setError('网络连接不稳定，正在尝试恢复录音…');
       } else {
         setError(`语音识别出错：${event.error}`);
       }
@@ -141,9 +154,30 @@ export function useSpeechRecognition(
       if (recRef.current === rec) recRef.current = null;
       startedRef.current = false;
       stopRequestedRef.current = false;
-      setListening(false);
       setInterim('');
-      onEndRef.current(finalRef.current);
+
+      // 只有用户手动停止才结束录音
+      if (manualStopRef.current) {
+        setListening(false);
+        onEndRef.current(finalRef.current);
+        return;
+      }
+
+      // 浏览器语音服务自动结束时，自动续录，保持录音不中断
+      if (autoRestartCountRef.current >= MAX_AUTO_RESTARTS) {
+        autoRestartCountRef.current = 0;
+        setListening(false);
+        setError('语音识别服务中断，录音已停止，请手动重新开始。');
+        onEndRef.current(finalRef.current);
+        return;
+      }
+      autoRestartCountRef.current += 1;
+      restartTimerRef.current = window.setTimeout(() => {
+        restartTimerRef.current = null;
+        if (!manualStopRef.current) {
+          beginRecognition();
+        }
+      }, RESTART_DELAY);
     };
 
     try {
@@ -151,16 +185,34 @@ export function useSpeechRecognition(
       recRef.current = rec;
       setListening(true);
     } catch {
+      setListening(false);
       setError('无法启动语音识别，请检查麦克风权限后重试。');
     }
   }, []);
 
+  const start = useCallback(() => {
+    clearRestartTimer();
+    finalRef.current = '';
+    manualStopRef.current = false;
+    autoRestartCountRef.current = 0;
+    setFinalText('');
+    setInterim('');
+    setError(null);
+    beginRecognition();
+  }, [beginRecognition]);
+
   const stop = useCallback(() => {
+    clearRestartTimer();
     const rec = recRef.current;
-    if (!rec) return;
+    manualStopRef.current = true;
+    if (!rec) {
+      // 没有活动会话（例如还在等待权限），直接结束
+      setListening(false);
+      onEndRef.current(finalRef.current);
+      return;
+    }
     stopRequestedRef.current = true;
-    // 识别尚未真正开始（例如正在等待麦克风权限），
-    // 等 onstart 触发后再自动停止
+    // 识别尚未真正开始（例如正在等待麦克风权限），等 onstart 触发后再停止
     if (!startedRef.current) return;
     try {
       rec.stop();
@@ -171,8 +223,7 @@ export function useSpeechRecognition(
         // 忽略异常
       }
     }
-    // 兜底：部分浏览器在 continuous 模式下 stop() 不生效，
-    // 若一段时间内未结束则强制中止
+    // 兜底：部分浏览器在 continuous 模式下 stop() 不生效，强制中止
     window.setTimeout(() => {
       if (recRef.current === rec && startedRef.current) {
         try {
@@ -186,6 +237,7 @@ export function useSpeechRecognition(
 
   useEffect(
     () => () => {
+      clearRestartTimer();
       recRef.current?.abort();
     },
     [],
